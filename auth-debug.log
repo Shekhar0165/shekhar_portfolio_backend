@@ -1,0 +1,9 @@
+{
+  "loginDto": {
+    "username": "admin",
+    "password": "password"
+  },
+  "envUser": "admin",
+  "envPass": "password",
+  "envPath": "E:\\ShekharKashyap\\portfolio\\backend"
+}
