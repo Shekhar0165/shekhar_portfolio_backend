@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
+import { ScheduleModule } from '@nestjs/schedule';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ProjectsModule } from './projects/projects.module';
@@ -14,10 +15,12 @@ import { TerminalConfigModule } from './terminal-config/terminal-config.module';
 import { SubscriberModule } from './subscriber/subscriber.module';
 import { CategoryModule } from './category/category.module';
 import { UploadModule } from './upload/upload.module';
+import { AiBlogModule } from './ai-blog/ai-blog.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    ScheduleModule.forRoot(),
     MongooseModule.forRootAsync({
       imports: [ConfigModule],
       useFactory: async (configService: ConfigService) => ({
@@ -36,6 +39,7 @@ import { UploadModule } from './upload/upload.module';
     SubscriberModule,
     CategoryModule,
     UploadModule,
+    AiBlogModule,
   ],
   controllers: [AppController],
   providers: [AppService],

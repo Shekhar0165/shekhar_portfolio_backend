@@ -31,6 +31,55 @@
 $ npm install
 ```
 
+## AI Blog Workflow (Admin)
+
+The backend now includes an AI pipeline endpoint for generating and publishing blog posts:
+
+- `POST /ai-blog/generate` (JWT protected)
+- `GET /ai-blog/runs` (JWT protected)
+- `GET /ai-blog/runs/:id` (JWT protected)
+
+Required environment variables for AI workflow:
+
+```bash
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_TEXT_MODEL=gemini-2.0-flash
+GEMINI_IMAGE_MODEL=gemini-2.0-flash-preview-image-generation
+GEMINI_ENABLE_GOOGLE_SEARCH=false
+GEMINI_MAX_RETRIES=3
+GEMINI_RETRY_BASE_MS=1500
+GEMINI_RETRY_MAX_MS=15000
+
+AI_QUALITY_MIN_SCORE=78
+AI_PLAGIARISM_MIN_SCORE=85
+AI_FACT_MIN_SCORE=70
+AI_AGENT2_MAX_RETRIES=2
+AI_ALLOW_CATEGORY_CREATE=false
+
+AI_AUTO_DAILY_ENABLED=true
+AI_DAILY_CRON=0 9 * * *
+AI_DAILY_TIMEZONE=Asia/Kolkata
+
+# Optional: external plagiarism provider
+AI_PLAGIARISM_API_URL=
+AI_PLAGIARISM_API_KEY=
+AI_PLAGIARISM_API_KEY_HEADER=x-api-key
+
+# Optional: Serper web evidence for fact checks
+SERPER_API_KEY=
+SERPER_API_URL=https://google.serper.dev/search
+```
+
+Notes:
+
+- If image generation fails, the workflow falls back to a generated SVG cover and uploads it to S3.
+- Gemini calls now use retry/backoff for transient 429/503/500 responses.
+- Category auto-creation is disabled by default and controlled via `AI_ALLOW_CATEGORY_CREATE`.
+- Strict category rotation is tracked in MongoDB so categories are not repeated until all are covered.
+- If `AI_PLAGIARISM_API_URL` is configured, Agent 2 uses external plagiarism scoring; otherwise it falls back to internal similarity scoring.
+- If `SERPER_API_KEY` is configured, Agent 2 adds web-grounded evidence into factual validation prompts.
+- AI run records now include fact score, plagiarism provider, and evidence snippets for admin audit visibility.
+
 ## Compile and run the project
 
 ```bash
