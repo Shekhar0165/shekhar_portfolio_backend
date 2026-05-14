@@ -9,6 +9,7 @@ import { AiBlogService } from './ai-blog.service.js';
 import { GroqLlmService } from './services/groq-llm.service.js';
 import { TrendScoutService } from './services/trend-scout.service.js';
 import { KeywordResearchService } from './services/keyword-research.service.js';
+import { WebResearchService } from './services/web-research.service.js';
 import { AiBlogRun, AiBlogRunSchema } from './schemas/ai-blog-run.schema.js';
 import { AiEditorialState, AiEditorialStateSchema } from './schemas/ai-editorial-state.schema.js';
 import { AiTopicHistory, AiTopicHistorySchema } from './schemas/ai-topic-history.schema.js';
@@ -31,6 +32,7 @@ import { AiTopicHistory, AiTopicHistorySchema } from './schemas/ai-topic-history
         GroqLlmService,
         TrendScoutService,
         KeywordResearchService,
+        WebResearchService,
     ],
     exports: [AiBlogService],
 })

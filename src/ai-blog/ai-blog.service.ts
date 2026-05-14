@@ -12,6 +12,7 @@ import { AiTopicHistory, AiTopicHistoryDocument } from './schemas/ai-topic-histo
 import { GroqLlmService } from './services/groq-llm.service.js';
 import { TrendScoutService, TrendScoutResult } from './services/trend-scout.service.js';
 import { KeywordResearchService, KeywordResearchResult } from './services/keyword-research.service.js';
+import { WebResearchService, ResearchBrief } from './services/web-research.service.js';
 
 interface Agent0Plan {
     categoryName: string;
@@ -22,6 +23,7 @@ interface Agent0Plan {
     keywords: string[];
     trendData: TrendScoutResult | null;
     keywordResearch: KeywordResearchResult | null;
+    research?: ResearchBrief | null;
 }
 
 interface GeneratedDraft {
@@ -87,6 +89,7 @@ export class AiBlogService {
         private readonly groqLlm: GroqLlmService,
         private readonly trendScout: TrendScoutService,
         private readonly keywordResearch: KeywordResearchService,
+        private readonly webResearch: WebResearchService,
     ) { }
 
     async generateAndPublish(dto: GenerateAiBlogDto, triggerType: 'manual' | 'scheduled' = 'manual'): Promise<AiBlogRun> {
@@ -108,6 +111,12 @@ export class AiBlogService {
 
             const kwResult = await this.agent05KeywordResearcher(plan, run._id.toString());
             plan.keywordResearch = kwResult;
+
+            await this.updateRun(run._id.toString(), {
+                currentStep: 'agent08-web-research',
+            }, 'Starting web research (Serper + page scrape)');
+
+            plan.research = await this.agent08WebResearcher(plan, run._id.toString());
 
             let draft = await this.agent1Writer(plan, dto.seedTopic);
             const maxValidationRetries = Number(process.env.AI_AGENT2_MAX_RETRIES || 2);
@@ -133,10 +142,18 @@ export class AiBlogService {
                 if (finalValidation.pass) break;
 
                 if (i < maxValidationRetries) {
-                    await this.updateRun(run._id.toString(), {
-                        currentStep: 'agent1-rewrite',
-                    }, 'Agent 2 requested fixes, rewriting draft');
-                    draft = await this.agent1Rewrite(draft, finalValidation.issues);
+                    const route = this.classifyValidationIssues(finalValidation.issues, draft);
+                    if (route.action === 'expand') {
+                        await this.updateRun(run._id.toString(), {
+                            currentStep: 'agent1-expand',
+                        }, `Agent 2 wants more depth (${route.wordCount} words); expanding in place`);
+                        draft = await this.agent1Expander(draft, route.wordCount, plan);
+                    } else {
+                        await this.updateRun(run._id.toString(), {
+                            currentStep: 'agent1-rewrite',
+                        }, 'Agent 2 requested structural fixes, rewriting draft');
+                        draft = await this.agent1Rewrite(draft, finalValidation.issues, plan);
+                    }
                 }
             }
 
@@ -308,8 +325,8 @@ export class AiBlogService {
                 currentStep: 'agent0-topic-planning',
                 trendingTopic: trendData.trendingTopic,
                 trendingScore: trendData.trendingScore,
-                topicSource: 'google-trends',
-            }, `Trending topic found: "${trendData.trendingTopic}" (${trendData.trendingScore})`);
+                topicSource: trendData.source,
+            }, `Trending topic found: "${trendData.trendingTopic}" (${trendData.trendingScore}) from ${trendData.source}`);
 
             const prompt = [
                 'You are Agent 0 (Topic Planner).',
@@ -404,12 +421,37 @@ export class AiBlogService {
         }
     }
 
+    // ─── Agent 0.8: Web Researcher (Serper + page scrape) ───────────────
+
+    private async agent08WebResearcher(plan: Agent0Plan, runId: string): Promise<ResearchBrief | null> {
+        try {
+            const kw = plan.keywordResearch;
+            const extraQueries = [
+                kw?.primaryKeyword,
+                ...(kw?.longTailKeywords || []).slice(0, 2),
+                ...(plan.trendData?.relatedQueries || []).slice(0, 2),
+            ].filter((q): q is string => !!q);
+
+            const brief = await this.webResearch.research(plan.topic, extraQueries);
+
+            await this.updateRun(runId, {}, `Web research done: ${brief.sources.length} pages scraped, ${brief.factualBullets.length} facts extracted`);
+
+            return brief;
+        } catch (error: any) {
+            this.logger.warn(`Web research failed: ${error?.message}, writer will work without it`);
+            await this.updateRun(runId, {}, 'Web research failed, continuing without external grounding');
+            return null;
+        }
+    }
+
     // ─── Agent 1: Writer (Groq) ─────────────────────────────────────────
 
     private async agent1Writer(plan: Agent0Plan, seedTopic?: string): Promise<GeneratedDraft> {
         const kw = plan.keywordResearch;
         const existingPosts = await this.blogService.findAll(true);
         const internalLinks = this.buildInternalLinksContext(existingPosts, plan.topic, plan.tags);
+
+        const researchBlock = plan.research ? this.webResearch.formatForPrompt(plan.research, 3500) : '';
 
         const prompt = [
             'You are a senior backend engineer writing an in-depth technical tutorial.',
@@ -423,16 +465,26 @@ export class AiBlogService {
             kw ? `Suggested headings: ${kw.recommendedHeadings.join('; ')}` : '',
             kw ? `FAQ questions: ${kw.peopleAlsoAsk.join('; ')}` : '',
             '',
-            'RULES:',
-            '- Write 1000-1500 words minimum with REAL practical depth',
-            '- Include 3+ code blocks using <pre><code class="language-xxx">...</code></pre>',
-            '- Use semantic HTML: h2, h3, p, ul/ol, pre/code, strong, em, table',
-            '- Structure: Introduction → Core Concepts → Step-by-Step Implementation → Code Examples → Best Practices → FAQ (4+ questions as h3) → Conclusion',
-            '- Write like an engineer sharing production experience, not an AI overview',
-            '- Use keyword variations naturally, never stuff',
-            '- Title: include primary keyword + year (2026) or "Step-by-Step Guide", keep under 60 chars',
-            '- Slug: clean, readable, no random numbers (e.g., "jenkins-ci-cd-tutorial")',
-            internalLinks ? `- Link to related posts: ${internalLinks}` : '',
+            researchBlock,
+            researchBlock ? '' : '',
+            'HARD RULES (the article will be REJECTED if any of these fail):',
+            '- TOTAL LENGTH: 1300–1700 words of body content. Do NOT stop early. Count carefully.',
+            '- GROUND every factual claim in the research material above. Use real version numbers, real CLI flags, real config syntax. Do NOT invent APIs or statistics.',
+            '- Include 4 code blocks MINIMUM, each 8–25 lines, using <pre><code class="language-xxx">...</code></pre>. Real, runnable code — not "// ... your code here" placeholders.',
+            '- Use semantic HTML only: h2, h3, p, ul, ol, li, pre, code, strong, em, blockquote, table.',
+            '- Required section structure with target word counts (sum ≈ 1500):',
+            '    1. Introduction (h2): 150–200 words — hook + why this matters + what reader will learn',
+            '    2. Core Concepts / How It Works (h2): 250–350 words with 1 code block',
+            '    3. Step-by-Step Implementation (h2): 350–450 words with 2 code blocks and numbered <ol> steps',
+            '    4. Real-World Example or Production Patterns (h2): 200–250 words with 1 code block',
+            '    5. Best Practices & Gotchas (h2): 150–200 words as a <ul> of 5–7 concrete items',
+            '    6. FAQ (h2 with h3 questions): 4–6 questions, each answered in 50–80 words',
+            '    7. Conclusion (h2): 80–120 words — recap + next step',
+            '- Voice: write like a senior engineer sharing production experience. No "as an AI", no fluff intros.',
+            '- Use the primary keyword in the title, the first paragraph, and 2–3 H2 headings, naturally.',
+            '- Title: includes the primary keyword + a qualifier like "Step-by-Step Guide" or "in 2026", under 60 chars.',
+            '- Slug: clean, readable, hyphen-separated, no random numbers (e.g., "jenkins-ci-cd-tutorial").',
+            internalLinks ? `- Link to 1–2 related posts in the body using <a href="...">...</a>: ${internalLinks}` : '',
             '',
             'Return JSON: {title, slug, excerpt (150 chars), content (HTML), seoKeywords (array), tags (array), readingTime, metaDescription (155 chars), coverImagePrompt (3-sentence vivid image description with colors/style/tech elements)}',
         ].filter(Boolean).join('\n');
@@ -441,15 +493,17 @@ export class AiBlogService {
         return this.normalizeDraft(draft, plan);
     }
 
-    private async agent1Rewrite(previous: GeneratedDraft, issues: string[]): Promise<GeneratedDraft> {
+    private async agent1Rewrite(previous: GeneratedDraft, issues: string[], plan?: Agent0Plan): Promise<GeneratedDraft> {
         const existingPosts = await this.blogService.findAll(true);
         const internalLinks = this.buildInternalLinksContext(existingPosts, previous.title, previous.tags);
+        const researchBlock = plan?.research ? this.webResearch.formatForPrompt(plan.research, 2500) : '';
 
         const prompt = [
             'Rewrite and EXPAND this technical article. Fix these issues:',
             issues.map(i => `- ${i}`).join('\n'),
             '',
-            'RULES: expand to 1000+ words, add code blocks if missing, add FAQ section, use semantic HTML, write like an engineer.',
+            researchBlock,
+            'RULES: expand to 1000+ words, add code blocks if missing, add FAQ section, use semantic HTML, write like an engineer. Ground claims in the research material above when available.',
             internalLinks ? `Link to related posts: ${internalLinks}` : '',
             '',
             'Return JSON: {title, slug, excerpt, content, seoKeywords, tags, readingTime, metaDescription, coverImagePrompt}',
@@ -468,6 +522,73 @@ export class AiBlogService {
             keywords: previous.seoKeywords,
             trendData: null,
             keywordResearch: null,
+        });
+    }
+
+    /**
+     * Focused expansion pass: keeps the existing article structure intact and
+     * grows it to the target length by deepening explanations and adding code
+     * examples in the *thinnest* sections. Far less wasteful than a full rewrite
+     * when the only validation issue is word count.
+     */
+    private async agent1Expander(
+        previous: GeneratedDraft,
+        currentWordCount: number,
+        plan?: Agent0Plan,
+    ): Promise<GeneratedDraft> {
+        const researchBlock = plan?.research ? this.webResearch.formatForPrompt(plan.research, 2500) : '';
+        const deficit = Math.max(400, 1500 - currentWordCount);
+
+        const prompt = [
+            'You are expanding an existing technical article. KEEP the article structure, voice, title, slug, tags, excerpt, and metaDescription exactly as-is.',
+            `The current content is ${currentWordCount} words. Expand it by AT LEAST ${deficit} more words.`,
+            '',
+            'Expansion rules:',
+            '- Identify the thinnest H2 sections and deepen them with more explanation, examples, and real-world context.',
+            '- Add at least 1–2 new code blocks (8–25 lines each) using <pre><code class="language-xxx">...</code></pre>. Real code, no placeholders.',
+            '- Add 1–2 more FAQ <h3> questions if there are fewer than 5.',
+            '- Convert thin paragraphs into <ul>/<ol> lists or tables where appropriate.',
+            '- Preserve every existing sentence; only ADD, never delete content (unless a sentence is duplicated).',
+            '- Do NOT change the H2 order. Do NOT add an "AI says" or "I am an AI" disclaimer.',
+            '',
+            researchBlock,
+            researchBlock ? 'Use the research material above to ground new claims in real facts.' : '',
+            '',
+            'Return JSON: {title, slug, excerpt, content (HTML), seoKeywords, tags, readingTime, metaDescription, coverImagePrompt}',
+            '',
+            `Title: ${previous.title}`,
+            `Slug: ${previous.slug}`,
+            `Excerpt: ${previous.excerpt}`,
+            `MetaDescription: ${previous.metaDescription}`,
+            `Tags: ${previous.tags.join(', ')}`,
+            `SeoKeywords: ${previous.seoKeywords.join(', ')}`,
+            `Current HTML content (EXPAND THIS, don't replace it):`,
+            previous.content.slice(0, 9000),
+        ].filter(Boolean).join('\n');
+
+        const expanded = await this.groqLlm.callGroqJson<GeneratedDraft>(prompt, { maxTokens: 8000 });
+
+        // Defensive: keep canonical identifiers from the original draft so SEO isn't accidentally rewritten.
+        const merged: GeneratedDraft = {
+            ...expanded,
+            title: previous.title,
+            slug: previous.slug,
+            excerpt: previous.excerpt,
+            metaDescription: previous.metaDescription,
+            tags: previous.tags,
+            seoKeywords: previous.seoKeywords,
+        };
+
+        return this.normalizeDraft(merged, {
+            categoryName: previous.tags[0] || 'General',
+            categorySlug: this.slugify(previous.tags[0] || 'general'),
+            topic: previous.title,
+            intent: 'Informational',
+            tags: previous.tags,
+            keywords: previous.seoKeywords,
+            trendData: null,
+            keywordResearch: null,
+            research: plan?.research,
         });
     }
 
@@ -555,6 +676,31 @@ export class AiBlogService {
             usedExternalPlagiarism,
             issues: allIssues,
         };
+    }
+
+    /**
+     * Decides whether validation failures can be fixed by an in-place expansion
+     * (cheaper, keeps the article structure) or need a full rewrite (different
+     * angle, fixes plagiarism / structural issues).
+     */
+    private classifyValidationIssues(
+        issues: string[],
+        draft: GeneratedDraft,
+    ): { action: 'expand' | 'rewrite'; wordCount: number } {
+        const wordCount = draft.content.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().split(/\s+/).length;
+
+        const blob = issues.join(' || ').toLowerCase();
+        const looksLikePlagiarism = /similar to existing|fresher angle|plagiarism/.test(blob);
+        const looksLikeStructure = /no code blocks|missing.*code|h2 heading|structure|sections/.test(blob);
+        const looksLikeFactual = /verify commands|invent|incorrect|inaccurate/.test(blob);
+
+        // If the article is just thin (>=500 words, has code blocks) and nothing
+        // structural/plagiarism/fact is wrong, expansion is the right move.
+        const hasCode = (draft.content.match(/<pre>|<code>/gi) || []).length > 0;
+        const isOnlyLength = wordCount >= 500 && hasCode &&
+            !looksLikePlagiarism && !looksLikeStructure && !looksLikeFactual;
+
+        return { action: isOnlyLength ? 'expand' : 'rewrite', wordCount };
     }
 
     private validateContentStructure(draft: GeneratedDraft): { hardFail: boolean; softIssues: string[] } {
