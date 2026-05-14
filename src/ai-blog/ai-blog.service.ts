@@ -119,6 +119,35 @@ export class AiBlogService {
             plan.research = await this.agent08WebResearcher(plan, run._id.toString());
 
             let draft = await this.agent1Writer(plan, dto.seedTopic);
+
+            // Proactive expansion: if the writer underdelivered on length, expand
+            // BEFORE the validator gets a chance to hard-fail. Loop up to 3 times,
+            // bailing out early if the LLM stops adding meaningful new content.
+            const targetWordCount = Number(process.env.AI_TARGET_WORD_COUNT || 1100);
+            const maxExpansions = Math.max(0, Number(process.env.AI_MAX_EXPANSIONS || 3));
+            let lastCount = this.countWords(draft.content);
+            for (let i = 0; i < maxExpansions && lastCount < targetWordCount; i++) {
+                await this.updateRun(run._id.toString(), {
+                    currentStep: 'agent1-proactive-expand',
+                }, `Draft is ${lastCount} words (target ${targetWordCount}); proactive expansion pass ${i + 1}`);
+
+                try {
+                    draft = await this.agent1Expander(draft, lastCount, plan);
+                } catch (error: any) {
+                    this.logger.warn(`Proactive expansion ${i + 1} failed: ${error?.message}; stopping expansion loop`);
+                    break;
+                }
+
+                const newCount = this.countWords(draft.content);
+                // If the LLM added fewer than 80 words, it's stuck — stop wasting tokens.
+                if (newCount - lastCount < 80) {
+                    this.logger.warn(`Expansion ${i + 1} added only ${newCount - lastCount} words; stopping loop`);
+                    lastCount = newCount;
+                    break;
+                }
+                lastCount = newCount;
+            }
+
             const maxValidationRetries = Number(process.env.AI_AGENT2_MAX_RETRIES || 2);
 
             let finalValidation: ValidationResult = {
@@ -687,32 +716,38 @@ export class AiBlogService {
         issues: string[],
         draft: GeneratedDraft,
     ): { action: 'expand' | 'rewrite'; wordCount: number } {
-        const wordCount = draft.content.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().split(/\s+/).length;
+        const wordCount = this.countWords(draft.content);
 
         const blob = issues.join(' || ').toLowerCase();
         const looksLikePlagiarism = /similar to existing|fresher angle|plagiarism/.test(blob);
         const looksLikeStructure = /no code blocks|missing.*code|h2 heading|structure|sections/.test(blob);
         const looksLikeFactual = /verify commands|invent|incorrect|inaccurate/.test(blob);
 
-        // If the article is just thin (>=500 words, has code blocks) and nothing
-        // structural/plagiarism/fact is wrong, expansion is the right move.
+        // If the article has reasonable bones (>=400 words, at least one code block)
+        // and nothing structural/plagiarism/fact is broken, expansion is the right move.
         const hasCode = (draft.content.match(/<pre>|<code>/gi) || []).length > 0;
-        const isOnlyLength = wordCount >= 500 && hasCode &&
+        const isOnlyLength = wordCount >= 400 && hasCode &&
             !looksLikePlagiarism && !looksLikeStructure && !looksLikeFactual;
 
         return { action: isOnlyLength ? 'expand' : 'rewrite', wordCount };
     }
 
+    private countWords(html: string): number {
+        if (!html) return 0;
+        const plainText = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!plainText) return 0;
+        return plainText.split(/\s+/).length;
+    }
+
     private validateContentStructure(draft: GeneratedDraft): { hardFail: boolean; softIssues: string[] } {
         const issues: string[] = [];
-        const plainText = draft.content.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-        const wordCount = plainText.split(/\s+/).length;
+        const wordCount = this.countWords(draft.content);
         let hardFail = false;
 
-        if (wordCount < 500) {
+        if (wordCount < 400) {
             issues.push(`Content is only ~${wordCount} words — far too short. Expand to at least 800+ words with implementation details, code examples, and practical steps.`);
             hardFail = true;
-        } else if (wordCount < 800) {
+        } else if (wordCount < 700) {
             issues.push(`Content is ~${wordCount} words. Add more code examples and expand explanations to reach 1000+ words.`);
             hardFail = true;
         }
