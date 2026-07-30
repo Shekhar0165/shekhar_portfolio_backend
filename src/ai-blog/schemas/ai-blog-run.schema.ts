@@ -79,6 +79,14 @@ export class AiBlogRun {
     @Prop({ default: '' })
     error!: string;
 
+    /** True when image generation was attempted but failed (or skipped). Blog was published without a cover image. */
+    @Prop({ default: false })
+    imageGenerationSkipped!: boolean;
+
+    /** The final cover image URL for this run. Empty string means no image was attached. */
+    @Prop({ default: '' })
+    coverImageUrl!: string;
+
     @Prop({ type: Date, default: null })
     startedAt!: Date | null;
 

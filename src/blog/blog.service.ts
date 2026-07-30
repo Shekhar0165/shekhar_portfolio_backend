@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Blog, BlogDocument } from './schemas/blog.schema';
@@ -9,6 +9,8 @@ import { UploadService } from '../upload/upload.service';
 
 @Injectable()
 export class BlogService {
+    private readonly logger = new Logger(BlogService.name);
+
     constructor(
         @InjectModel(Blog.name) private blogModel: Model<BlogDocument>,
         private readonly subscriberService: SubscriberService,
@@ -19,16 +21,17 @@ export class BlogService {
         const createdBlog = new this.blogModel(createBlogDto);
         const saved = await createdBlog.save();
 
-        // Notify subscribers if the post is published
+        // Notify subscribers if the post is published (fire-and-forget — never blocks publishing)
         if (saved.published) {
             this.subscriberService
                 .notifySubscribers({
                     title: saved.title,
                     slug: saved.slug,
                     excerpt: saved.excerpt,
-                    coverImage: saved.coverImage,
+                    coverImage: saved.coverImage ?? undefined,
                 })
-                .catch((err) => console.error('Failed to notify subscribers:', err));
+                .then(() => this.logger.log(`[Subscribers] Notification completed for: ${saved.title}`))
+                .catch((err) => this.logger.warn(`[Subscribers] Notification failed for "${saved.title}": ${err?.message}`));
         }
 
         return saved;

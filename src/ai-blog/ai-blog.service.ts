@@ -119,6 +119,7 @@ export class AiBlogService {
             plan.research = await this.agent08WebResearcher(plan, run._id.toString());
 
             let draft = await this.agent1Writer(plan, dto.seedTopic);
+            this.logger.log('[Blog] Article generated.');
 
             // Proactive expansion: if the writer underdelivered on length, expand
             // BEFORE the validator gets a chance to hard-fail. Loop up to 3 times,
@@ -208,20 +209,28 @@ export class AiBlogService {
                 seoScore: seo.seoScore,
             }, `SEO optimization score: ${seo.seoScore}`);
 
-            let coverImageUrl = '';
-            try {
-                coverImageUrl = await this.generateCoverImageAndUpload(
-                    seo.improvedTitle || draft.title,
-                    draft.coverImagePrompt,
-                );
+            await this.updateRun(run._id.toString(), {
+                currentStep: 'agent4-image-generation',
+            }, '[Image] Generating cover image...');
+            this.logger.log('[Image] Generating cover image...');
+
+            const coverImageUrl = await this.tryBuildAndUploadCoverImage(
+                seo.improvedTitle || draft.title,
+                draft.coverImagePrompt,
+            );
+
+            if (coverImageUrl) {
                 await this.updateRun(run._id.toString(), {
                     currentStep: 'publishing',
-                }, 'Cover image generated and uploaded, publishing blog');
-            } catch (imgError: any) {
-                this.logger.warn(`Cover image generation failed: ${imgError?.message}. Publishing without image.`);
+                    coverImageUrl,
+                    imageGenerationSkipped: false,
+                }, '[Image] Cover image generated and uploaded successfully.');
+            } else {
+                this.logger.log('[Blog] Continuing without cover image.');
                 await this.updateRun(run._id.toString(), {
                     currentStep: 'publishing',
-                }, 'Cover image failed, publishing blog without image');
+                    imageGenerationSkipped: true,
+                }, '[Blog] Cover image skipped — continuing to publish.');
             }
 
             const created = await this.blogService.create({
@@ -229,7 +238,7 @@ export class AiBlogService {
                 slug: this.ensureSlugUnique(seo.improvedTitle || draft.title, seo.improvedSlug || draft.slug),
                 excerpt: seo.improvedExcerpt || draft.excerpt,
                 content: seo.improvedContent || draft.content,
-                coverImage: coverImageUrl || undefined,
+                coverImage: coverImageUrl ?? undefined,
                 published: dto.autoPublish ?? true,
                 seoKeywords: this.uniqueArray(seo.improvedSeoKeywords.length ? seo.improvedSeoKeywords : draft.seoKeywords),
                 tags: this.uniqueArray(seo.improvedTags.length ? seo.improvedTags : draft.tags),
@@ -237,6 +246,7 @@ export class AiBlogService {
                 readingTime: draft.readingTime,
                 metaDescription: seo.improvedMetaDescription || draft.metaDescription,
             });
+            this.logger.log('[Blog] Blog saved successfully.');
 
             await this.updateRun(run._id.toString(), {
                 status: 'published',
@@ -259,7 +269,8 @@ export class AiBlogService {
                 contentGaps: kwResult?.contentGaps || [],
                 llmProvider: 'groq',
                 finishedAt: new Date(),
-            }, 'Run completed and post published');
+            }, '[Blog] Published successfully.');
+            this.logger.log('[Blog] Published successfully.');
 
             await this.markCategoryCovered(plan.categorySlug);
             await this.saveTopicHistory(run._id.toString(), plan, created.title, (created as any)._id?.toString?.() || '');
@@ -919,29 +930,94 @@ export class AiBlogService {
         };
     }
 
-    // ─── Image Generation (Gemini — kept as-is) ─────────────────────────
+    // ─── Image Pipeline (three independent, never-throwing stages) ──────
 
-    private async generateCoverImageAndUpload(title: string, coverImagePrompt: string): Promise<string> {
-        const imageBuffer = await this.generateGeminiImage(coverImagePrompt || title);
-        const fallbackSvgBuffer = this.generateFallbackSvgCover(title);
-        const buffer = imageBuffer || fallbackSvgBuffer;
+    /**
+     * Stage A + B: generate a cover image buffer then upload it.
+     * Never throws. Returns the public URL on success, or null on any failure.
+     * If image generation fails, the fallback SVG is attempted automatically.
+     * If the fallback also fails, or upload fails, returns null so the
+     * caller can publish the blog without a cover image.
+     */
+    private async tryBuildAndUploadCoverImage(
+        title: string,
+        coverImagePrompt: string,
+    ): Promise<string | null> {
+        this._lastUsedFallback = false;
+        const buffer = await this.tryGenerateCoverImage(coverImagePrompt || title, title);
+        if (!buffer) return null;
 
-        const file = {
-            fieldname: 'file',
-            originalname: imageBuffer ? `${this.slugify(title)}.png` : `${this.slugify(title)}.svg`,
-            encoding: '7bit',
-            mimetype: imageBuffer ? 'image/png' : 'image/svg+xml',
-            size: buffer.length,
-            buffer,
-            stream: null as any,
-            destination: '',
-            filename: '',
-            path: '',
-        } as Express.Multer.File;
-
-        const uploaded = await this.uploadService.uploadFile(file, 'images/blog-ai');
-        return uploaded.url;
+        const isAiGenerated = !this._lastUsedFallback;
+        return this.tryUploadCoverImage(buffer, title, isAiGenerated);
     }
+
+    // Internal sentinel to detect whether we returned the fallback buffer.
+    // We use a private field set inside tryGenerateCoverImage.
+    private _lastUsedFallback = false;
+
+    /**
+     * Stage A: Generate a cover image buffer.
+     * Tries the Gemini AI image first; on failure, tries the local SVG fallback.
+     * Never throws. Returns Buffer on success, null if both strategies fail.
+     */
+    private async tryGenerateCoverImage(prompt: string, title: string): Promise<Buffer | null> {
+        this._lastUsedFallback = false;
+
+        // ── AI image generation ──────────────────────────────────────────
+        const aiBuffer = await this.generateGeminiImage(prompt);
+        if (aiBuffer) return aiBuffer;
+
+        // ── Fallback: SVG cover (always local, cannot network-fail) ──────
+        this.logger.warn('[WARN] Gemini image unavailable — attempting fallback SVG cover.');
+        try {
+            const svgBuffer = this.generateFallbackSvgCover(title);
+            this._lastUsedFallback = true;
+            return svgBuffer;
+        } catch (svgErr: any) {
+            this.logger.warn(
+                `[WARN] Fallback SVG generation also failed: ${svgErr?.message}. Blog will publish without any cover image.`,
+            );
+            return null;
+        }
+    }
+
+    /**
+     * Stage B: Upload a cover image buffer to S3.
+     * Never throws. Returns the public URL on success, null on failure.
+     */
+    private async tryUploadCoverImage(
+        buffer: Buffer,
+        title: string,
+        isAiGenerated: boolean,
+    ): Promise<string | null> {
+        try {
+            const ext = isAiGenerated ? 'png' : 'svg';
+            const mime = isAiGenerated ? 'image/png' : 'image/svg+xml';
+
+            const file = {
+                fieldname: 'file',
+                originalname: `${this.slugify(title)}.${ext}`,
+                encoding: '7bit',
+                mimetype: mime,
+                size: buffer.length,
+                buffer,
+                stream: null as any,
+                destination: '',
+                filename: '',
+                path: '',
+            } as Express.Multer.File;
+
+            const uploaded = await this.uploadService.uploadFile(file, 'images/blog-ai');
+            this.logger.log(`[Image] Cover image uploaded: ${uploaded.url}`);
+            return uploaded.url;
+        } catch (uploadErr: any) {
+            this.logger.warn(
+                `[WARN] Cover image upload failed: ${uploadErr?.message}. Blog will publish without cover image.`,
+            );
+            return null;
+        }
+    }
+
 
     private async generateGeminiImage(prompt: string): Promise<Buffer | null> {
         const apiKey = process.env.GEMINI_API_KEY;
@@ -992,7 +1068,7 @@ export class AiBlogService {
             this.logger.log('Gemini image generated successfully');
             return Buffer.from(imagePart.inlineData.data, 'base64');
         } catch (error) {
-            this.logger.warn(`Gemini image generation error: ${(error as Error).message}`);
+            this.logger.warn(`[WARN] Image generation failed: ${(error as Error).message}`);
             return null;
         }
     }

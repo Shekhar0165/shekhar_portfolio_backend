@@ -17,8 +17,8 @@ export class Blog {
     @Prop({ required: true })
     excerpt!: string;
 
-    @Prop()
-    coverImage?: string;
+    @Prop({ type: String, default: null })
+    coverImage?: string | null;
 
     @Prop({ default: false })
     published!: boolean;
